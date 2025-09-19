@@ -309,23 +309,87 @@ def rebuild_single_apk(arg_source_apk_full_path, arg_output_apk_full_path):
 
     # building a new .apk file with apktool
     log_info('Building a new .apk file')
-    command = ['java', '-jar', str(tools.apktool_path), 'build', str(decompiled_path), '--use-aapt2', '--output', str(arg_output_apk_full_path)]
+    command = [
+        'java', '-jar', str(tools.apktool_path),
+        'build', str(decompiled_path),
+        '--use-aapt2', '--output', str(arg_output_apk_full_path)
+    ]
     subprocess.run(command, stdout=sys.stdout, stderr=sys.stderr)
     garbage['files'].append(arg_output_apk_full_path)
 
-    # sign the new .apk file with uber-apk-signer
-    log_info('Signing the new .apk file')
-    command = ['java', '-jar', str(tools.uber_apk_signer_path), '--apks', str(arg_output_apk_full_path), '--allowResign', '--overwrite']
-    if args.ks:
-        command.extend(['--ks', args.ks, '--ksPass', args.ks_pass, '--ksAlias', args.ks_alias, '--ksKeyPass', args.ks_alias_pass])
-    subprocess.run(command, stdout=sys.stdout, stderr=sys.stderr)
+    # --- Ensure resources.arsc is uncompressed ---
+    log_info('Ensuring resources.arsc is uncompressed')
+    ensure_arsc_uncompressed(arg_output_apk_full_path)
 
-    # removing the decompiled directory if atgument '--preserve' was not provided
+    # --- Zipalign ---
+    log_info('Zipaligning the APK')
+    zipalign_path = shutil.which('zipalign')
+    if not zipalign_path:
+        log_err('zipalign not found in PATH. Please install Android SDK Build-tools.')
+        exit_script(1)
+
+    aligned_apk_path = str(arg_output_apk_full_path).replace('.apk', '-aligned.apk')
+    command = [
+        zipalign_path, '-f', '-p', '4',
+        str(arg_output_apk_full_path),
+        aligned_apk_path
+    ]
+    result = subprocess.run(command, stdout=sys.stdout, stderr=sys.stderr)
+    if result.returncode != 0:
+        log_err('zipalign failed.')
+        exit_script(1)
+
+    # Optionally remove the unaligned APK to avoid confusion
+    Path(arg_output_apk_full_path).unlink(missing_ok=True)
+
+    # --- NEW: apksigner step ---
+    log_info('Signing the aligned APK with apksigner')
+    apksigner_path = shutil.which('apksigner')
+    if not apksigner_path:
+        log_err('apksigner not found in PATH. Please install Android SDK Build-tools.')
+        exit_script(1)
+
+    # Set keystore details
+    ks_path = args.ks if args.ks else str(Path.home().joinpath('.android', 'debug.keystore'))
+    ks_alias = args.ks_alias if args.ks_alias else 'androiddebugkey'
+    ks_pass = args.ks_pass if args.ks_pass else 'android'
+    ks_key_pass = args.ks_alias_pass if args.ks_alias_pass else 'android'
+
+    command = [
+        apksigner_path, 'sign',
+        '--ks', ks_path,
+        '--ks-key-alias', ks_alias,
+        '--ks-pass', f'pass:{ks_pass}',
+        '--key-pass', f'pass:{ks_key_pass}',
+        aligned_apk_path
+    ]
+    result = subprocess.run(command, stdout=sys.stdout, stderr=sys.stderr)
+    if result.returncode != 0:
+        log_err('APK signing failed.')
+        exit_script(1)
+
+    # At this point, aligned_apk_path is the final APK for install
+    garbage['files'].append(Path(aligned_apk_path))
+
+    # removing the decompiled directory if argument '--preserve' was not provided
     if not args.preserve:
         log_info(f'Removing decompiled directory {colors.WARNING}{decompiled_path}')
         shutil.rmtree(decompiled_path, ignore_errors=True)
 
-
+def ensure_arsc_uncompressed(apk_path):
+    # Create a temporary APK file
+    temp_apk_path = str(apk_path) + ".uncompressed"
+    with zipfile.ZipFile(apk_path, 'r') as zin, zipfile.ZipFile(temp_apk_path, 'w') as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            # Store resources.arsc uncompressed
+            if item.filename == 'resources.arsc':
+                zout.writestr(item.filename, data, compress_type=zipfile.ZIP_STORED)
+            else:
+                zout.writestr(item, data)
+    # Replace the original APK with the modified one
+    Path(apk_path).unlink()
+    Path(temp_apk_path).rename(apk_path)
 
 def main():
     # handle Ctrl+C
